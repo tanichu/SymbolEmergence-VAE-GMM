@@ -17,14 +17,20 @@ any differences between versions remain to be checked.
 - Gaussian proposal normalization and acceptance use log-space arithmetic.
 - NumPy is seeded in addition to torch.
 
+## Mutual-inference repair (2026-10-24)
+
+The GMM now supplies each agent's own word-conditioned mean and **full covariance**
+to the next VAE round. The loss uses analytic KL from diagonal recognition Gaussian
+to full prior Gaussian, with a batch sum in both initial and feedback rounds.
+VAE weights/Adam state and GMM/private-word state continue rather than restart.
+Extraction is batched and order-checked. MODEL.md records the blockwise approximation
+and Adam-state choice; neither is claimed to recover undocumented historical details.
+Use --mutual-iterations 1 to disable subsequent feedback, or a larger value to test it.
+
 ## Remaining work (not silently repaired)
 
-- Section 3.2 describes feedback between GMM and VAE; the current outer loop runs
-  once and does not return its data-dependent prior arrays. Multi-round feedback,
-  VAE checkpoint continuation and covariance approximation need an explicit specification.
-- The VAE currently has a diagonal recognition distribution, and the unused feedback
-  path keeps only covariance diagonals. A full-covariance prior requires the appropriate
-  KL, not an undocumented diagonal replacement.
+- Full-prior transfer, checkpoint continuation and numerical KL tests are now
+  implemented; a full performance reproduction and independent audit remain pending.
 - Section 4.1 and the current defaults differ in data selection, GMM prior scale,
   update counts and number of mutual-inference rounds. No reported performance has
   been reproduced; do not compare against published scores yet.
@@ -61,3 +67,17 @@ two sklearn warnings because kappa is undefined for its single constant label;
 no kappa value is asserted or treated as a scientific result. The process exited
 0; pyreadline also printed a console destructor error during interpreter shutdown.
 No image training or MNIST download was run.
+
+That paragraph describes the initial patch only. Subsequent verification on
+2026-10-24: all 12 synthetic/integration tests passed, with the same two warnings
+from the old single-label word fixture. A real MNIST smoke run (256 images, seed 2,
+2 outer rounds, 1 VAE epoch and 2 MH sweeps per round, batch 32) completed on CUDA.
+This checks execution and feedback, not categorization performance. No published
+score is claimed. Data and generated models are kept outside the repository.
+
+Example smoke command:
+
+```
+python main.py --samples 256 --batch-size 32 --vae-iter 1 --mh-iter 2 --mutual-iterations 2 --seed 2 --run-dir PATH_TO_NEW_RUN
+python check_feedback_run.py PATH_TO_NEW_RUN
+```

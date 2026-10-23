@@ -4,10 +4,28 @@ from torch import nn, optim
 from torch.nn import functional as F
 from torchvision.utils import save_image
 import numpy as np
+import json
+from pathlib import Path
 import matplotlib.pyplot as plt
 from tool import visualize_ls, sample, get_param
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+
+def gaussian_kl(en_mu, en_logvar, prior_mu, prior_cov):
+    """KL(diagonal recognition Gaussian || full GMM Gaussian), per image."""
+    mu, logvar = en_mu.double(), en_logvar.double()
+    pm = torch.as_tensor(prior_mu, device=mu.device, dtype=mu.dtype)
+    cov = torch.as_tensor(prior_cov, device=mu.device, dtype=mu.dtype)
+    if pm.shape != mu.shape or cov.shape != (*mu.shape, mu.shape[-1]):
+        raise ValueError("Prior arrays must match each image's latent dimensions")
+    chol = torch.linalg.cholesky(cov)
+    precision = torch.cholesky_inverse(chol)
+    delta = mu - pm
+    trace = (precision.diagonal(dim1=-2, dim2=-1) * logvar.exp()).sum(-1)
+    quadratic = torch.einsum('bi,bij,bj->b', delta, precision, delta)
+    logdet = 2 * chol.diagonal(dim1=-2, dim2=-1).log().sum(-1)
+    return 0.5 * (trace + quadratic - mu.shape[-1] + logdet - logvar.sum(-1))
 
 x_dim = 12
 h_dim = 1024
@@ -99,32 +117,27 @@ class VAE(nn.Module):
         # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
         # https://arxiv.org/abs/1312.6114 
         if iteration != 0: 
-            gmm_mu = nn.Parameter(gmm_mu)
-            prior_mu = gmm_mu
-            prior_mu.requires_grad = False
-            prior_mu = prior_mu.expand_as(en_mu).to(device)
-            gmm_var = nn.Parameter(gmm_var)
-            prior_var = gmm_var
-            prior_var.requires_grad = False
-            prior_var = prior_var.expand_as(en_logvar).to(device)
-            prior_logvar = nn.Parameter(prior_var.log())
-            prior_logvar.requires_grad = False
-            prior_logvar = prior_logvar.expand_as(en_logvar).to(device)
-            
-            var_division = en_logvar.exp() / prior_var # Σ_0 / Σ_1
-            diff = en_mu - prior_mu # μ_１ - μ_0
-            diff_term = diff *diff / prior_var # (μ_1 - μ_0)(μ_1 - μ_0)/Σ_1
-            logvar_division = prior_logvar - en_logvar # log|Σ_1| - log|Σ_0| = log(|Σ_1|/|Σ_2|)
-            KLD = 0.5 * ((var_division + diff_term + logvar_division).sum(1) - x_dim)
+            KLD = gaussian_kl(en_mu, en_logvar, gmm_mu, gmm_var).sum()
         else:
             KLD = -0.5 * torch.sum(1 + en_logvar - en_mu.pow(2) - en_logvar.exp())
         return BCE + KLD
 
 def train(iteration, gmm_mu, gmm_var, epoch, train_loader, batch_size, all_loader, model_dir, agent):
-    prior_mean = torch.Tensor(len(train_loader), x_dim).float().fill_(0.0) # 最初のVAEの事前分布の\mu
+    if not isinstance(train_loader.sampler, torch.utils.data.SequentialSampler) or train_loader.drop_last:
+        raise ValueError("Feedback priors require sequential, complete image order")
     model = VAE().to(device)
     print(f"VAE_Agent {agent} Training Start({iteration}): Epoch:{epoch}, Batch_size:{batch_size}")
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    resumed = None
+    if iteration:
+        resumed = Path(model_dir) / 'pth' / f'train{agent}_{iteration-1}.pth'
+        state = torch.load(resumed, map_location=device, weights_only=True)
+        model.load_state_dict(state['model'])
+        optimizer.load_state_dict(state['optimizer'])
+        if gmm_mu.shape != (len(train_loader.dataset), x_dim) or gmm_var.shape != (len(train_loader.dataset), x_dim, x_dim):
+            raise ValueError("Expected full word-conditioned prior for every image")
+        np.savez(Path(model_dir) / 'npy' / f'used_prior{agent}_{iteration}.npz',
+                 mean=gmm_mu.cpu().numpy(), covariance=gmm_var.cpu().numpy())
     loss_list = np.zeros((epoch))
     for i in range(epoch):
         model.train()
@@ -138,6 +151,8 @@ def train(iteration, gmm_mu, gmm_var, epoch, train_loader, batch_size, all_loade
             else:
                 loss = model.loss_function(recon_batch, data, mu, logvar, gmm_mu[batch_idx*batch_size:(batch_idx+1)*batch_size], gmm_var[batch_idx*batch_size:(batch_idx+1)*batch_size], iteration=iteration)
             loss = loss.mean()
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Non-finite VAE objective")
             loss.backward()
             train_loss += loss.item()
             optimizer.step()
@@ -158,6 +173,13 @@ def train(iteration, gmm_mu, gmm_var, epoch, train_loader, batch_size, all_loade
     
     np.save(model_dir+'/npy/loss'+agent+'_'+str(iteration)+'.npy', np.array(loss_list))
     torch.save(model.state_dict(), model_dir+"/pth/vae"+agent+"_"+str(iteration)+".pth")
+    torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict()},
+               Path(model_dir) / 'pth' / f'train{agent}_{iteration}.pth')
+    (Path(model_dir) / 'log' / f'vae{agent}_{iteration}.json').write_text(json.dumps({
+        'iteration': iteration, 'agent': agent, 'resumed_from': str(resumed) if resumed else None,
+        'prior': 'full-gmm' if iteration else 'standard-normal',
+        'epochs': epoch, 'final_negative_objective_per_image': float(loss_list[-1]),
+    }, indent=2), encoding='utf-8')
     
     x_d, label = send_all_x(iteration=iteration, all_loader=all_loader, model_dir=model_dir, agent=agent)
 
@@ -192,12 +214,15 @@ def plot_latent(iteration, all_loader, model_dir, agent):
         break
 
 def send_all_x(iteration, all_loader, model_dir, agent):
+    if not isinstance(all_loader.sampler, torch.utils.data.SequentialSampler) or all_loader.drop_last:
+        raise ValueError("Latent extraction requires sequential, complete image order")
     model = VAE().to(device)
     model.load_state_dict(torch.load(model_dir+"/pth/vae"+agent+"_"+str(iteration)+".pth"))
     model.eval()
-    for batch_idx, (data, label) in enumerate(all_loader):
-        data = data.to(device)
-        recon_batch, mu, logvar, x_d = model(data)
-        x_d = x_d.cpu()
-        label = label.cpu()
-    return x_d.detach().numpy(), label.detach().numpy()
+    latent_batches, label_batches = [], []
+    with torch.no_grad():
+        for data, label in all_loader:
+            x_d, _, _ = model.encode(data.to(device))
+            latent_batches.append(x_d.cpu().numpy())
+            label_batches.append(label.cpu().numpy())
+    return np.concatenate(latent_batches), np.concatenate(label_batches)

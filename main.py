@@ -1,5 +1,9 @@
 import argparse
 import os
+import json
+import hashlib
+from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, Tuple
 
 import matplotlib.pyplot as plt
@@ -55,11 +59,17 @@ def parse_arguments() -> argparse.Namespace:
         "--no-cuda", action="store_true", default=False, help="enables CUDA training"
     )
     parser.add_argument("--seed", type=int, default=2, metavar="S", help="random seed")
+    parser.add_argument("--mutual-iterations", type=int, default=5)
+    parser.add_argument("--samples", type=int, default=10000, help="MNIST smoke/subset size, not balanced selection")
+    parser.add_argument("--data-root", default="../data")
+    parser.add_argument("--run-dir", default=None)
 
     args = parser.parse_args()
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    if min(args.mutual_iterations, args.samples, args.vae_iter, args.mh_iter, args.batch_size) <= 0:
+        parser.error("Iteration counts, sample count and batch size must be positive")
 
     if args.debug:
         args.vae_iter = 2
@@ -68,10 +78,12 @@ def parse_arguments() -> argparse.Namespace:
     return args
 
 
-def setup_directories(file_name: str = "debug") -> Dict[str, str]:
+def setup_directories(file_name=None) -> Dict[str, str]:
     """Create necessary directories for saving results."""
     model_dir = "./model"
-    dir_name = f"./model/{file_name}"
+    dir_name = str(file_name) if file_name else f"./model/run-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+    if os.path.exists(dir_name):
+        raise FileExistsError(f"Refusing to overwrite an existing run: {dir_name}")
 
     directories = {
         "model_dir": model_dir,
@@ -93,7 +105,7 @@ def setup_directories(file_name: str = "debug") -> Dict[str, str]:
     return directories
 
 
-def prepare_datasets(batch_size: int) -> Tuple[Any, Any, Any, Any, int, np.ndarray]:
+def prepare_datasets(batch_size: int, samples=10000, data_root="../data") -> Tuple[Any, Any, Any, Any, int, np.ndarray]:
     """Prepare MNIST datasets for both agents with different rotation angles."""
     print("Dataset : MNIST")
 
@@ -110,14 +122,16 @@ def prepare_datasets(batch_size: int) -> Tuple[Any, Any, Any, Any, int, np.ndarr
 
     # Define datasets
     trainval_dataset1 = datasets.MNIST(
-        "./../data", train=True, transform=trans_ang1, download=True
+        data_root, train=True, transform=trans_ang1, download=True
     )  # Dataset for Agent A
     trainval_dataset2 = datasets.MNIST(
-        "./../data", train=True, transform=trans_ang2, download=True
+        data_root, train=True, transform=trans_ang2, download=True
     )  # Dataset for Agent B
 
     n_samples = len(trainval_dataset1)
-    D = int(n_samples * (1 / 6))  # Total data
+    D = samples
+    if not 0 < D <= n_samples:
+        raise ValueError("Requested sample count is outside the MNIST training split")
 
     subset1_indices1 = list(range(0, D))
     subset2_indices1 = list(range(D, n_samples))
@@ -136,10 +150,10 @@ def prepare_datasets(batch_size: int) -> Tuple[Any, Any, Any, Any, int, np.ndarr
         train_dataset2, batch_size=batch_size, shuffle=False
     )  # train_loader for agent B
     all_loader1 = torch.utils.data.DataLoader(
-        train_dataset1, batch_size=D, shuffle=False
+        train_dataset1, batch_size=batch_size, shuffle=False
     )
     all_loader2 = torch.utils.data.DataLoader(
-        train_dataset2, batch_size=D, shuffle=False
+        train_dataset2, batch_size=batch_size, shuffle=False
     )
 
     return train_loader1, train_loader2, all_loader1, all_loader2, D, subset1_indices1
@@ -464,23 +478,16 @@ def run_metropolis_hastings(
                 f"B2A:{int(accept_count_BtoA[i])}"
             )
 
-        # Update mu_d and var_d for next iteration
-        mu_d_A = np.zeros((D, dim))
-        var_d_A = np.zeros((D, dim))
-        mu_d_B = np.zeros((D, dim))
-        var_d_B = np.zeros((D, dim))
-
-        for d in range(D):
-            mu_d_A[d] = params["mu_kd_A"][np.argmax(w_dk[d])]
-            var_d_A[d] = np.diag(
-                np.linalg.inv(params["lambda_kdd_A"][np.argmax(w_dk[d])])
-            )
-            mu_d_B[d] = params["mu_kd_B"][np.argmax(w_dk[d])]
-            var_d_B[d] = np.diag(
-                np.linalg.inv(params["lambda_kdd_B"][np.argmax(w_dk[d])])
-            )
-
     return ARI_A, ARI_B, concidence, accept_count_AtoB, accept_count_BtoA
+
+
+def feedback_priors(params, agent):
+    """Local word -> own GMM mean and full covariance; no shared-label readout."""
+    words = params[f"w_dk_{agent}"].argmax(axis=1)
+    means = params[f"mu_kd_{agent}"][words].copy()
+    covariance = np.linalg.inv(params[f"lambda_kdd_{agent}"])[words].copy()
+    np.linalg.cholesky(covariance)  # Fail explicitly if the GMM prior is not SPD.
+    return means, covariance
 
 
 def save_results(
@@ -567,14 +574,20 @@ def main():
     # Parse arguments and setup
     args = parse_arguments()
     device = torch.device("cuda" if args.cuda else "cpu")
+    cnn_vae_module_mnist.device = device
     print("CUDA", args.cuda)
 
     # Setup directories
-    directories = setup_directories()
+    directories = setup_directories(args.run_dir)
+    source_hashes = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                     for name in ('main.py', 'cnn_vae_module_mnist.py')}
+    (Path(directories['dir_name']) / 'run.json').write_text(
+        json.dumps({'args': vars(args), 'source_sha256': source_hashes,
+                    'torch': torch.__version__, 'numpy': np.__version__}, indent=2), encoding='utf-8')
 
     # Prepare datasets
     train_loader1, train_loader2, all_loader1, all_loader2, D, _ = prepare_datasets(
-        args.batch_size
+        args.batch_size, args.samples, args.data_root
     )
 
     print(f"Total data:{D}, Category:{args.category}")
@@ -582,11 +595,12 @@ def main():
     print(f"MH_iter:{args.mh_iter}, MH_mode:{args.mode}(-1:Com 0:No-com 1:All accept)")
 
     # Initialize variables for mutual learning
-    mutual_iteration = 1
+    mutual_iteration = args.mutual_iterations
     mu_d_A = np.zeros(D)
     var_d_A = np.zeros(D)
     mu_d_B = np.zeros(D)
     var_d_B = np.zeros(D)
+    params = None
 
     for it in range(mutual_iteration):
         # Train VAE agents
@@ -609,7 +623,8 @@ def main():
         dim = len(c_nd_A[0])
 
         # Initialize GMM parameters
-        params = initialize_gmm_parameters(K, dim, D)
+        if params is None:
+            params = initialize_gmm_parameters(K, dim, D)
 
         # Run Metropolis-Hastings algorithm
         (
@@ -622,6 +637,11 @@ def main():
 
         # Save results
         save_results(params, ARI_A, ARI_B, concidence, directories, it)
+        mu_d_A, var_d_A = feedback_priors(params, "A")
+        mu_d_B, var_d_B = feedback_priors(params, "B")
+        for agent, mean, covariance in [('A', mu_d_A, var_d_A), ('B', mu_d_B, var_d_B)]:
+            np.savez(Path(directories['npy_dir']) / f'feedback{agent}_{it}.npz',
+                     mean=mean, covariance=covariance, words=params[f'w_dk_{agent}'])
 
         # Create plots
         create_plots(
