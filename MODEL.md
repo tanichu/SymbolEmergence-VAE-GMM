@@ -55,3 +55,10 @@ used-prior arrays and source hashes and show that round 1 actually consumes roun
 0 GMM feedback. Original reported ARI values are not test expectations.
 
 2026-10-24: first specification for full-prior feedback and persistent MI state.
+
+2026-10-24: Add --paper-mnist profile and --balanced/--prior-scale, making the
+reference-scale constants explicit without changing the old default profile.
+Add mode 2 centralized Gibbs, with joint-word likelihood product and updates to
+both local GMMs; mark its kappa non-applicable. ARI is now computed directly
+without unnecessary supervised relabeling, and full-precision trajectories are
+saved. EVAL.md specifies seed retention and no-MI budget limitations.

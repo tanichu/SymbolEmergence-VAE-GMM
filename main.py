@@ -63,8 +63,19 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=10000, help="MNIST smoke/subset size, not balanced selection")
     parser.add_argument("--data-root", default="../data")
     parser.add_argument("--run-dir", default=None)
+    parser.add_argument("--balanced", action="store_true")
+    parser.add_argument("--prior-scale", type=float, default=0.1)
+    parser.add_argument("--paper-mnist", action="store_true", help="10k balanced, 100 VAE/MH epochs, 5 MI rounds, prior W=.05I")
+    parser.add_argument("--disable-mi", action="store_true", help="one initial VAE/GMM block; different total budget from MI")
 
     args = parser.parse_args()
+    if args.paper_mnist:
+        args.samples, args.vae_iter, args.mh_iter = 10000, 100, 100
+        args.mutual_iterations, args.balanced, args.prior_scale = 5, True, 0.05
+    if args.disable_mi:
+        args.mutual_iterations = 1
+    if args.mode not in (-1, 0, 1, 2) or args.prior_scale <= 0:
+        parser.error("Modes: -1 MHNG, 0 local Gibbs, 1 all-accept, 2 central Gibbs; prior scale must be positive")
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -105,7 +116,7 @@ def setup_directories(file_name=None) -> Dict[str, str]:
     return directories
 
 
-def prepare_datasets(batch_size: int, samples=10000, data_root="../data") -> Tuple[Any, Any, Any, Any, int, np.ndarray]:
+def prepare_datasets(batch_size: int, samples=10000, data_root="../data", balanced=False) -> Tuple[Any, Any, Any, Any, int, np.ndarray]:
     """Prepare MNIST datasets for both agents with different rotation angles."""
     print("Dataset : MNIST")
 
@@ -134,6 +145,11 @@ def prepare_datasets(batch_size: int, samples=10000, data_root="../data") -> Tup
         raise ValueError("Requested sample count is outside the MNIST training split")
 
     subset1_indices1 = list(range(0, D))
+    if balanced:
+        if D % 10:
+            raise ValueError("Balanced MNIST requires sample count divisible by 10")
+        labels = trainval_dataset1.targets.numpy()
+        subset1_indices1 = sorted(np.concatenate([np.flatnonzero(labels == k)[:D // 10] for k in range(10)]).tolist())
     subset2_indices1 = list(range(D, n_samples))
     subset1_indices2 = list(range(0, D))
     subset2_indices2 = list(range(D, n_samples))
@@ -206,14 +222,14 @@ def train_vae_agents(
     return c_nd_A, c_nd_B, label
 
 
-def initialize_gmm_parameters(K: int, dim: int, D: int) -> Dict[str, np.ndarray]:
+def initialize_gmm_parameters(K: int, dim: int, D: int, prior_scale=0.1) -> Dict[str, np.ndarray]:
     """Initialize GMM parameters for both agents."""
     # Set hyperparameters
     beta = 1.0
     m_d_A = np.repeat(0.0, dim)
     m_d_B = np.repeat(0.0, dim)
-    w_dd_A = np.identity(dim) * 0.1
-    w_dd_B = np.identity(dim) * 0.1
+    w_dd_A = np.identity(dim) * prior_scale
+    w_dd_B = np.identity(dim) * prior_scale
     nu = dim
 
     # Initialize μ, Λ
@@ -462,12 +478,10 @@ def run_metropolis_hastings(
                 pred_label_B.append(np.argmax(params["w_dk_B"][d]))
 
         # Evaluation
-        _, result_a = calc_ari(pred_label_A, z_truth_n)
-        _, result_b = calc_ari(pred_label_B, z_truth_n)
-
-        concidence[i] = np.round(cohen_kappa_score(pred_label_A, pred_label_B), 3)
-        ARI_A[i] = np.round(ari(z_truth_n, result_a), 3)
-        ARI_B[i] = np.round(ari(z_truth_n, result_b), 3)
+        # ARI is permutation-invariant; label matching is only for display.
+        concidence[i] = cohen_kappa_score(pred_label_A, pred_label_B)
+        ARI_A[i] = ari(z_truth_n, pred_label_A)
+        ARI_B[i] = ari(z_truth_n, pred_label_B)
         accept_count_AtoB[i] = count_AtoB
         accept_count_BtoA[i] = count_BtoA
 
@@ -479,6 +493,33 @@ def run_metropolis_hastings(
             )
 
     return ARI_A, ARI_B, concidence, accept_count_AtoB, accept_count_BtoA
+
+
+def central_word_probabilities(a, b, params):
+    """Uniform-prior centralized word conditional, evaluated in log space."""
+    scores = []
+    K = len(params['mu_kd_A'])
+    for agent, latent in [('A', a), ('B', b)]:
+        scores.append(np.column_stack([
+            multivariate_normal.logpdf(latent, mean=params[f'mu_kd_{agent}'][k],
+                                      cov=np.linalg.inv(params[f'lambda_kdd_{agent}'][k]))
+            for k in range(K)]))
+    joint = scores[0] + scores[1]
+    return np.exp(joint - logsumexp(joint, axis=1, keepdims=True))
+
+
+def run_central_gibbs(args, a, b, params, K, D, dim, labels):
+    ari_a, ari_b = np.zeros(args.mh_iter), np.zeros(args.mh_iter)
+    for iteration in range(args.mh_iter):
+        probs = central_word_probabilities(a, b, params)
+        words = np.array([np.random.multinomial(1, p) for p in probs])
+        params['w_dk_A'][:] = words
+        params['w_dk_B'][:] = words
+        update_gmm_parameters(words, a, params, 'A', K, dim)
+        update_gmm_parameters(words, b, params, 'B', K, dim)
+        ari_a[iteration] = ari_b[iteration] = ari(labels, words.argmax(axis=1))
+    # Common word agreement and acceptance counts are not communication metrics.
+    return ari_a, ari_b, np.full(args.mh_iter, np.nan), np.zeros(args.mh_iter), np.zeros(args.mh_iter)
 
 
 def feedback_priors(params, agent):
@@ -586,9 +627,10 @@ def main():
                     'torch': torch.__version__, 'numpy': np.__version__}, indent=2), encoding='utf-8')
 
     # Prepare datasets
-    train_loader1, train_loader2, all_loader1, all_loader2, D, _ = prepare_datasets(
-        args.batch_size, args.samples, args.data_root
+    train_loader1, train_loader2, all_loader1, all_loader2, D, indices = prepare_datasets(
+        args.batch_size, args.samples, args.data_root, args.balanced
     )
+    np.save(Path(directories['npy_dir']) / 'image_indices.npy', indices)
 
     print(f"Total data:{D}, Category:{args.category}")
     print(f"VAE_iter:{args.vae_iter}, Batch_size:{args.batch_size}")
@@ -624,7 +666,7 @@ def main():
 
         # Initialize GMM parameters
         if params is None:
-            params = initialize_gmm_parameters(K, dim, D)
+            params = initialize_gmm_parameters(K, dim, D, args.prior_scale)
 
         # Run Metropolis-Hastings algorithm
         (
@@ -633,10 +675,14 @@ def main():
             concidence,
             accept_count_AtoB,
             accept_count_BtoA,
-        ) = run_metropolis_hastings(args, c_nd_A, c_nd_B, params, K, D, dim, z_truth_n)
+        ) = (run_central_gibbs if args.mode == 2 else run_metropolis_hastings)(
+            args, c_nd_A, c_nd_B, params, K, D, dim, z_truth_n)
 
         # Save results
         save_results(params, ARI_A, ARI_B, concidence, directories, it)
+        np.savez(Path(directories['npy_dir']) / f'metrics_{it}.npz',
+                 ari_a=ARI_A, ari_b=ARI_B, kappa=concidence,
+                 acceptance_a_to_b=accept_count_AtoB, acceptance_b_to_a=accept_count_BtoA)
         mu_d_A, var_d_A = feedback_priors(params, "A")
         mu_d_B, var_d_B = feedback_priors(params, "B")
         for agent, mean, covariance in [('A', mu_d_A, var_d_A), ('B', mu_d_B, var_d_B)]:

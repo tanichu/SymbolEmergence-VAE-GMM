@@ -34,7 +34,8 @@ Use --mutual-iterations 1 to disable subsequent feedback, or a larger value to t
 - Section 4.1 and the current defaults differ in data selection, GMM prior scale,
   update counts and number of mutual-inference rounds. No reported performance has
   been reproduced; do not compare against published scores yet.
-- Centralized Gibbs control and held-out evaluation remain to be implemented.
+- Centralized Gibbs and a named reference-scale profile are now implemented;
+  full trials and held-out evaluation remain pending. See EVAL.md.
 - Existing reported maxima, saved parameters, and terminal private-word metrics need
   consistent readouts. Per-round scientific results have not been generated here.
 - Independent audit is required before making publication claims.
