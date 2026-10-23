@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from scipy.stats import multivariate_normal, wishart
+from scipy.special import logsumexp
 from sklearn.metrics import cohen_kappa_score
 from sklearn.metrics.cluster import adjusted_rand_score as ari
 from torch.utils.data.dataset import Subset
@@ -58,6 +59,7 @@ def parse_arguments() -> argparse.Namespace:
     args = parser.parse_args()
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     if args.debug:
         args.vae_iter = 2
@@ -240,18 +242,16 @@ def compute_eta_matrix(
     c_nd: np.ndarray, mu_kd: np.ndarray, lambda_kdd: np.ndarray, K: int, D: int
 ) -> np.ndarray:
     """Compute eta matrix for probability calculations."""
-    tmp_eta_n = np.zeros((K, D))
-    eta_dk = np.zeros((D, K))
-
+    log_eta = np.empty((D, K))
     for k in range(K):
-        tmp_eta_n[k] = np.diag(
-            -0.5 * (c_nd - mu_kd[k]).dot(lambda_kdd[k]).dot((c_nd - mu_kd[k]).T)
-        ).copy()
-        tmp_eta_n[k] += 0.5 * np.log(np.linalg.det(lambda_kdd[k]) + 1e-7)
-        eta_dk[:, k] = np.exp(tmp_eta_n[k])
-
-    eta_dk /= np.sum(eta_dk, axis=1, keepdims=True)
-    return eta_dk
+        sign, logdet = np.linalg.slogdet(lambda_kdd[k])
+        if sign <= 0:
+            raise ValueError("Precision matrix must have positive determinant")
+        delta = c_nd - mu_kd[k]
+        log_eta[:, k] = 0.5 * logdet - 0.5 * np.einsum(
+            "di,ij,dj->d", delta, lambda_kdd[k], delta
+        )
+    return np.exp(log_eta - logsumexp(log_eta, axis=1, keepdims=True))
 
 
 def metropolis_hastings_step(
@@ -268,7 +268,9 @@ def metropolis_hastings_step(
     D: int,
 ) -> Tuple[np.ndarray, int, list]:
     """Perform one step of Metropolis-Hastings algorithm."""
-    w_dk = np.random.multinomial(1, [1 / K] * K, size=D)
+    # Algorithm 1 returns the listener's current word on rejection.
+    # A proposal is temporary; it must not overwrite the speaker's stored word.
+    w_dk = w_dk_listener.copy()
     count_accept = 0
     pred_labels = []
 
@@ -280,33 +282,36 @@ def metropolis_hastings_step(
 
     for d in range(D):
         # Sample w for speaker
-        w_dk_speaker[d] = np.random.multinomial(
+        proposal = np.random.multinomial(
             n=1, pvals=eta_dk_speaker[d], size=1
         ).flatten()
 
         if args.mode == 0:  # No communication
+            # Independent local Gibbs update (not an utterance).
+            w_dk_speaker[d] = proposal
             pred_labels.append(np.argmax(w_dk_speaker[d]))
         elif args.mode == 1:  # All accept
-            w_dk[d] = w_dk_speaker[d]
+            w_dk[d] = proposal
             count_accept += 1
             pred_labels.append(np.argmax(w_dk[d]))
         else:  # Normal Metropolis-Hastings
-            cat_liks_speaker[d] = multivariate_normal.pdf(
+            cat_liks_speaker[d] = multivariate_normal.logpdf(
                 listener_data[d],
-                mean=listener_mu[np.argmax(w_dk_speaker[d])],
-                cov=np.linalg.inv(listener_lambda[np.argmax(w_dk_speaker[d])]),
+                mean=listener_mu[np.argmax(proposal)],
+                cov=np.linalg.inv(listener_lambda[np.argmax(proposal)]),
             )
-            cat_liks_listener[d] = multivariate_normal.pdf(
+            cat_liks_listener[d] = multivariate_normal.logpdf(
                 listener_data[d],
                 mean=listener_mu[np.argmax(w_dk_listener[d])],
                 cov=np.linalg.inv(listener_lambda[np.argmax(w_dk_listener[d])]),
             )
-            judge_r = cat_liks_speaker[d] / cat_liks_listener[d]
-            judge_r = min(1, judge_r)
+            log_ratio = cat_liks_speaker[d] - cat_liks_listener[d]
+            if not np.isfinite(log_ratio):
+                raise FloatingPointError("Non-finite MH log likelihood ratio")
             rand_u = np.random.rand()
 
-            if judge_r >= rand_u:
-                w_dk[d] = w_dk_speaker[d]
+            if rand_u == 0.0 or np.log(rand_u) <= min(0.0, log_ratio):
+                w_dk[d] = proposal
                 count_accept += 1
             else:
                 w_dk[d] = w_dk_listener[d]
@@ -400,6 +405,7 @@ def run_metropolis_hastings(
         )
 
         if args.mode != 0:
+            params["w_dk_B"][:] = w_dk
             pred_label_B.extend(pred_label_B_temp)
 
         # Update parameters for listener B
@@ -425,6 +431,7 @@ def run_metropolis_hastings(
         )
 
         if args.mode != 0:
+            params["w_dk_A"][:] = w_dk
             pred_label_A.extend(pred_label_A_temp)
 
         # Update parameters for listener A
