@@ -5,6 +5,7 @@ param
 result
 dataset
 model*
+!MODEL.md
 pth
 obj_data
 debug_program/*npy
