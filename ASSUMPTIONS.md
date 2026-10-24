@@ -63,3 +63,13 @@ learning behavior. Existing exact-equality checks are useful controlled diagnost
 results, not a requirement to force long stochastic trajectories to match.
 Do not tune inference to make final outcomes numerically identical. Future
 numerical tolerances must be stated before judging the corresponding test.
+
+## 2026-10-24: three-category multi-view fruit feasibility pilot
+
+See KIRI_PILOT.md before training: distinct scan IDs, fixed ID-level splits,
+same-object different-camera pairs, 64x64 RGB recognition/decoder adaptation.
+Reuse latent12 and word/GMM updates without changing the full-prior semantics.
+RGB pixel BCE is a reconstruction surrogate, not a physical likelihood or F_d.
+The first pilot has one seed and short budgets; no convergence/held-out performance
+claims. Classes and splits are data preparation; labels are ignored by VAE
+training and used only for category-balanced selection and evaluation.

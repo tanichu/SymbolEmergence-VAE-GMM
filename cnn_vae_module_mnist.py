@@ -123,10 +123,10 @@ class VAE(nn.Module):
             KLD = -0.5 * torch.sum(1 + en_logvar - en_mu.pow(2) - en_logvar.exp())
         return BCE + KLD
 
-def train(iteration, gmm_mu, gmm_var, epoch, train_loader, batch_size, all_loader, model_dir, agent, cache_prior=False, gpu_images=False, epoch_sync=False):
+def train(iteration, gmm_mu, gmm_var, epoch, train_loader, batch_size, all_loader, model_dir, agent, cache_prior=False, gpu_images=False, epoch_sync=False, model_factory=None):
     if not isinstance(train_loader.sampler, torch.utils.data.SequentialSampler) or train_loader.drop_last:
         raise ValueError("Feedback priors require sequential, complete image order")
-    model = VAE().to(device)
+    model = (model_factory or VAE)().to(device)
     print(f"VAE_Agent {agent} Training Start({iteration}): Epoch:{epoch}, Batch_size:{batch_size}")
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     resumed = None
@@ -216,7 +216,7 @@ def train(iteration, gmm_mu, gmm_var, epoch, train_loader, batch_size, all_loade
         'gpu_images': gpu_images, 'epoch_sync': epoch_sync,
     }, indent=2), encoding='utf-8')
     
-    x_d, label = send_all_x(iteration=iteration, all_loader=all_loader, model_dir=model_dir, agent=agent)
+    x_d, label = send_all_x(iteration=iteration, all_loader=all_loader, model_dir=model_dir, agent=agent, model_factory=model_factory)
 
     # Send latent variable x_d to GMM
     return x_d, label, loss_list
@@ -248,10 +248,10 @@ def plot_latent(iteration, all_loader, model_dir, agent):
         visualize_ls(iteration, x_d.detach().numpy(), label, model_dir,agent=agent)
         break
 
-def send_all_x(iteration, all_loader, model_dir, agent):
+def send_all_x(iteration, all_loader, model_dir, agent, model_factory=None):
     if not isinstance(all_loader.sampler, torch.utils.data.SequentialSampler) or all_loader.drop_last:
         raise ValueError("Latent extraction requires sequential, complete image order")
-    model = VAE().to(device)
+    model = (model_factory or VAE)().to(device)
     model.load_state_dict(torch.load(model_dir+"/pth/vae"+agent+"_"+str(iteration)+".pth"))
     model.eval()
     latent_batches, label_batches = [], []

@@ -71,10 +71,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--cache-prior', action='store_true')
     parser.add_argument('--gpu-images', action='store_true')
     parser.add_argument('--epoch-sync', action='store_true')
+    parser.add_argument('--paired-manifest', default=None, help='Fixed RGB64 paired-image manifest; separate from MNIST')
 
     args = parser.parse_args()
     if args.gpu_images and not args.cache_images:
         parser.error('--gpu-images requires --cache-images')
+    if args.paired_manifest and (args.paper_mnist or args.gpu_images or args.cache_images):
+        parser.error('Paired RGB inputs use their own fixed loader, not MNIST profiles/image caches')
     if args.paper_mnist:
         args.samples, args.vae_iter, args.mh_iter = 10000, 100, 100
         args.mutual_iterations, args.balanced, args.prior_scale = 5, True, 0.05
@@ -204,6 +207,11 @@ def train_vae_agents(
         f"------------------Mutual learning session {iteration} begins------------------"
     )
 
+    model_options = {}
+    if getattr(args, 'paired_manifest', None):
+        from vae_rgb64 import RGBVAE
+        model_options['model_factory'] = RGBVAE
+
     # Train VAE module on Agent A
     c_nd_A, label, loss_list = cnn_vae_module_mnist.train(
         iteration=iteration,
@@ -218,6 +226,7 @@ def train_vae_agents(
         cache_prior=getattr(args, 'cache_prior', False),
         gpu_images=getattr(args, 'gpu_images', False),
         epoch_sync=getattr(args, 'epoch_sync', False),
+        **model_options,
     )
 
     # Train VAE module on Agent B
@@ -234,6 +243,7 @@ def train_vae_agents(
         cache_prior=getattr(args, 'cache_prior', False),
         gpu_images=getattr(args, 'gpu_images', False),
         epoch_sync=getattr(args, 'epoch_sync', False),
+        **model_options,
     )
 
     return c_nd_A, c_nd_B, label
@@ -690,9 +700,22 @@ def main():
                     'torch': torch.__version__, 'numpy': np.__version__}, indent=2), encoding='utf-8')
 
     # Prepare datasets
-    train_loader1, train_loader2, all_loader1, all_loader2, D, indices = prepare_datasets(
-        args.batch_size, args.samples, args.data_root, args.balanced, args.cache_images
-    )
+    if args.paired_manifest:
+        from paired_images import prepare_paired
+        train_loader1, train_loader2, all_loader1, all_loader2, D, indices = prepare_paired(args.paired_manifest, args.batch_size)
+        args.samples = D
+        metadata = Path(args.paired_manifest).read_bytes()
+        (Path(directories['dir_name'])/'paired-manifest.json').write_bytes(metadata)
+        run_record = json.loads((Path(directories['dir_name'])/'run.json').read_text())
+        run_record['args']['samples'] = D
+        run_record['paired_manifest_sha256'] = hashlib.sha256(metadata).hexdigest()
+        for filename in ('paired_images.py','vae_rgb64.py'):
+            run_record['source_sha256'][filename] = hashlib.sha256(Path(filename).read_bytes()).hexdigest()
+        (Path(directories['dir_name'])/'run.json').write_text(json.dumps(run_record,indent=2))
+    else:
+        train_loader1, train_loader2, all_loader1, all_loader2, D, indices = prepare_datasets(
+            args.batch_size, args.samples, args.data_root, args.balanced, args.cache_images
+        )
     np.save(Path(directories['npy_dir']) / 'image_indices.npy', indices)
 
     print(f"Total data:{D}, Category:{args.category}")
