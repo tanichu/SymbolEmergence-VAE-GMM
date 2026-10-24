@@ -34,6 +34,11 @@ agent's private full Gaussian word-conditioned prior. Pixel BCE + full Gaussian
 KL, batch sum, Adam .001. BCE on continuous rendered pixels is a reconstruction
 surrogate, not a calibrated physical image likelihood or manuscript F_d.
 
+Encoder channels are 3->32->64->128->256 with kernel4/stride2/padding1 and ReLU,
+yielding 256x4x4. Linear diagonal-Gaussian heads have dimension12. The decoder
+reverses this channel schedule from the linear 4096 features, ending in sigmoid.
+No pretrained weights, dropout or normalization layers are added.
+
 One fixed seed0, four methods, VAE10 epochs / naming10 sweeps per block, two
 blocks, batch32, normal-Wishart scale .05 and the existing remaining constants.
 No retries selected by ARI. Settings are chosen for short execution, not claimed
