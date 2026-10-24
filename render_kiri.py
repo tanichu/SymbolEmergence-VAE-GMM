@@ -8,6 +8,7 @@ parser=argparse.ArgumentParser()
 parser.add_argument('--pack',required=True)
 parser.add_argument('--output',required=True)
 parser.add_argument('--probe',action='store_true')
+parser.add_argument('--profile',choices=['multi-instance','distinct-shapes'],default='multi-instance')
 args=parser.parse_args(sys.argv[sys.argv.index('--')+1:])
 pack=Path(args.pack);out=Path(args.output)
 out.mkdir(parents=True,exist_ok=True)
@@ -15,11 +16,18 @@ if (out/'manifest.json').exists():raise FileExistsError('Refuse dataset overwrit
 selection={'Apple':(['A34','A59','A73'],'A81','A99'),
            'Orange':(['A49','A61','A62'],'A64','A67'),
            'Mango':(['A29','A57','A114'],'A115','A130')}
+if args.profile=='distinct-shapes':
+    selection={'Banana':(['A143'],None,None),'Pear':(['A112'],None,None),
+               'Apple':(['A34'],None,None),'Dragon_Fruit':(['A107'],None,None),
+               'Watermelon':(['A98'],None,None)}
 manifest=dict(protocol='Same physical scan, different camera views; development pilot',
     resolution=128,source_lod='mid',pairs=[],classes=list(selection),render_engine='CYCLES',samples=16)
+manifest['profile']=args.profile
+manifest['split_unit']='camera_azimuth_group' if args.profile=='distinct-shapes' else 'scan_id'
+first_id=next(iter(selection.values()))[0][0]
 for label,(category,(train,val,test)) in enumerate(selection.items()):
-    for ident in train+[val,test]:
-        if args.probe and ident!='A34':continue
+    for ident in [x for x in train+[val,test] if x is not None]:
+        if args.probe and ident!=first_id:continue
         bpy.ops.object.select_all(action='SELECT');bpy.ops.object.delete(use_global=False)
         model_files=list(pack.glob(f'*_Mid/Models/{ident}_*_mid.fbx'))
         if len(model_files)!=1:raise RuntimeError(f'Ambiguous source {ident}: {model_files}')
@@ -54,8 +62,13 @@ for label,(category,(train,val,test)) in enumerate(selection.items()):
         camera=bpy.data.cameras.new('camera');camera.type='ORTHO';camera.ortho_scale=3.1
         cam=bpy.data.objects.new('camera',camera);scene.collection.objects.link(cam);scene.camera=cam
         split='train' if ident in train else 'validation' if ident==val else 'test'
-        for elevation in ([20] if args.probe else [20,40]):
-            for azimuth in ([0] if args.probe else range(0,360,30)):
+        elevations=[10,25,40] if args.profile=='distinct-shapes' else [20,40]
+        azimuths=range(0,360,10) if args.profile=='distinct-shapes' else range(0,360,30)
+        for elevation in ([elevations[0]] if args.probe else elevations):
+            for azimuth in ([0] if args.probe else azimuths):
+                if args.profile=='distinct-shapes':
+                    remainder=(azimuth//10)%6
+                    split='validation' if remainder==0 else 'test' if remainder==3 else 'train'
                 row=dict(scan_id=ident,label=label,category=category,split=split,
                          source_fbx=str(model_files[0]),base_azimuth=azimuth,base_elevation=elevation)
                 for agent,da,de in [('a',0,0),('b',60,15)]:
@@ -67,6 +80,7 @@ for label,(category,(train,val,test)) in enumerate(selection.items()):
                     if path.exists():raise FileExistsError(path)
                     scene.render.filepath=str(path);bpy.ops.render.render(write_still=True)
                     row[agent]=filename
+                    row['pose_'+agent]=dict(azimuth=(azimuth+da)%360,elevation=elevation+de)
                 manifest['pairs'].append(row)
                 print('PAIR_DONE',ident,azimuth,elevation,flush=True)
 (out/'manifest.json').write_text(json.dumps(manifest,indent=2))

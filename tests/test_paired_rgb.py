@@ -26,6 +26,19 @@ def test_scan_split_leak_is_rejected(tmp_path):
     with pytest.raises(ValueError,match='leaked'):
         PairedImages(make_manifest(tmp_path,True),'a')
 
+def test_same_scan_different_pose_split_is_explicit(tmp_path):
+    path=make_manifest(tmp_path,True)
+    data=json.loads(path.read_text());data['split_unit']='camera_azimuth_group'
+    for i,row in enumerate(data['pairs']):
+        row['pose_a']=dict(azimuth=i*30,elevation=10)
+        row['pose_b']=dict(azimuth=i*30+60,elevation=25)
+    path.write_text(json.dumps(data))
+    assert len(PairedImages(path,'a'))==1
+    data['pairs'][1]['pose_a']=data['pairs'][0]['pose_b']
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError,match='Camera pose leaked'):
+        PairedImages(path,'a')
+
 def test_rgb_shape_and_full_prior_gradient():
     torch.manual_seed(0)
     model=RGBVAE()

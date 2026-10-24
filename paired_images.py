@@ -13,8 +13,20 @@ class PairedImages(Dataset):
         self.rows=[r for r in data['pairs'] if r['split']==split]
         if not self.rows:raise ValueError('Empty requested split')
         ids={s:{r['scan_id'] for r in data['pairs'] if r['split']==s} for s in ('train','validation','test')}
-        if any(ids[a]&ids[b] for a,b in [('train','validation'),('train','test'),('validation','test')]):
-            raise ValueError('Scan identity leaked across splits')
+        split_unit=data.get('split_unit','scan_id')
+        if split_unit=='scan_id':
+            if any(ids[a]&ids[b] for a,b in [('train','validation'),('train','test'),('validation','test')]):
+                raise ValueError('Scan identity leaked across splits')
+        elif split_unit=='camera_azimuth_group':
+            poses={}
+            for row in data['pairs']:
+                for view in ['a','b']:
+                    pose=row['pose_'+view]
+                    key=(row['scan_id'],float(pose['azimuth'])%360,float(pose['elevation']))
+                    if key in poses and poses[key]!=row['split']:
+                        raise ValueError('Camera pose leaked across splits')
+                    poses[key]=row['split']
+        else:raise ValueError('Unknown split unit')
         images=[]
         for row in self.rows:
             p=(path.parent/row[agent]).resolve()
