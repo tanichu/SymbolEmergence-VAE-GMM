@@ -62,3 +62,19 @@ Add mode 2 centralized Gibbs, with joint-word likelihood product and updates to
 both local GMMs; mark its kappa non-applicable. ARI is now computed directly
 without unnecessary supervised relabeling, and full-precision trajectories are
 saved. EVAL.md specifies seed retention and no-MI budget limitations.
+# Runtime-cache implementation note (2026-10-24)
+
+Additional opt-in `--gpu-images` keeps fixed image tensors on the CUDA device,
+and `--epoch-sync` batches host loss transfers at epoch boundaries. Same loss,
+gradient and optimizer semantics on finite runs; failure detection for nonfinite
+loss moves to epoch end and the failed run must be discarded. Sequential loader
+base-seed and per-image rotation RNG draws are preserved. Independent audit and
+long-run validation remain pending; these options do not alter an existing run.
+
+Direction-local MH likelihood caching replaces repeated covariance inversion with
+the same Gaussian precision quadratic; cache lifetime ends at each direction.
+Legacy kernel is retained for differential tests. Optional `--cache-images` and
+`--cache-prior` retain fixed pixels, sequential image-prior correspondence, RNG
+draws and the full-covariance FP64 KL. No change to PGM, prior or update budget.
+Development validation does not replace the pending independent audit.
+

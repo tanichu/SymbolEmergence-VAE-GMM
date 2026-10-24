@@ -67,8 +67,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--prior-scale", type=float, default=0.1)
     parser.add_argument("--paper-mnist", action="store_true", help="10k balanced, 100 VAE/MH epochs, 5 MI rounds, prior W=.05I")
     parser.add_argument("--disable-mi", action="store_true", help="one initial VAE/GMM block; different total budget from MI")
+    parser.add_argument('--cache-images', action='store_true')
+    parser.add_argument('--cache-prior', action='store_true')
+    parser.add_argument('--gpu-images', action='store_true')
+    parser.add_argument('--epoch-sync', action='store_true')
 
     args = parser.parse_args()
+    if args.gpu_images and not args.cache_images:
+        parser.error('--gpu-images requires --cache-images')
     if args.paper_mnist:
         args.samples, args.vae_iter, args.mh_iter = 10000, 100, 100
         args.mutual_iterations, args.balanced, args.prior_scale = 5, True, 0.05
@@ -116,7 +122,7 @@ def setup_directories(file_name=None) -> Dict[str, str]:
     return directories
 
 
-def prepare_datasets(batch_size: int, samples=10000, data_root="../data", balanced=False) -> Tuple[Any, Any, Any, Any, int, np.ndarray]:
+def prepare_datasets(batch_size: int, samples=10000, data_root="../data", balanced=False, cache_images=False) -> Tuple[Any, Any, Any, Any, int, np.ndarray]:
     """Prepare MNIST datasets for both agents with different rotation angles."""
     print("Dataset : MNIST")
 
@@ -158,6 +164,11 @@ def prepare_datasets(batch_size: int, samples=10000, data_root="../data", balanc
     val_dataset1 = Subset(trainval_dataset1, subset2_indices1)
     train_dataset2 = Subset(trainval_dataset2, subset1_indices1)
     val_dataset2 = Subset(trainval_dataset2, subset2_indices2)
+
+    if cache_images:
+        from runtime_cache import FixedRotationCache
+        train_dataset1 = FixedRotationCache(train_dataset1, angle_a)
+        train_dataset2 = FixedRotationCache(train_dataset2, angle_b)
 
     train_loader1 = torch.utils.data.DataLoader(
         train_dataset1, batch_size=batch_size, shuffle=False
@@ -204,6 +215,9 @@ def train_vae_agents(
         all_loader=all_loader1,
         model_dir=dir_name,
         agent="A",
+        cache_prior=getattr(args, 'cache_prior', False),
+        gpu_images=getattr(args, 'gpu_images', False),
+        epoch_sync=getattr(args, 'epoch_sync', False),
     )
 
     # Train VAE module on Agent B
@@ -217,6 +231,9 @@ def train_vae_agents(
         all_loader=all_loader2,
         model_dir=dir_name,
         agent="B",
+        cache_prior=getattr(args, 'cache_prior', False),
+        gpu_images=getattr(args, 'gpu_images', False),
+        epoch_sync=getattr(args, 'epoch_sync', False),
     )
 
     return c_nd_A, c_nd_B, label
@@ -284,7 +301,7 @@ def compute_eta_matrix(
     return np.exp(log_eta - logsumexp(log_eta, axis=1, keepdims=True))
 
 
-def metropolis_hastings_step(
+def metropolis_hastings_step_legacy(
     speaker_data: np.ndarray,
     listener_data: np.ndarray,
     speaker_mu: np.ndarray,
@@ -348,6 +365,52 @@ def metropolis_hastings_step(
             pred_labels.append(np.argmax(w_dk[d]))
 
     return w_dk, count_accept, pred_labels
+
+
+def gaussian_log_likelihoods(data, means, precisions):
+    """Unnormalized Gaussian log densities; common dimension constant cancels."""
+    scores = np.empty((len(data), len(means)))
+    for k, (mean, precision) in enumerate(zip(means, precisions)):
+        np.linalg.cholesky(precision)  # Reject non-SPD, not just positive det.
+        _, logdet = np.linalg.slogdet(precision)
+        delta = data - mean
+        scores[:, k] = 0.5 * logdet - 0.5 * np.einsum(
+            'di,ij,dj->d', delta, precision, delta)
+    if not np.isfinite(scores).all():
+        raise FloatingPointError('Non-finite Gaussian log likelihood')
+    return scores
+
+
+def metropolis_hastings_step(
+    speaker_data, listener_data, speaker_mu, speaker_lambda,
+    listener_mu, listener_lambda, w_dk_speaker, w_dk_listener, args, K, D,
+):
+    """Same sequential RNG calls/update semantics; density cache is direction-local."""
+    eta = compute_eta_matrix(speaker_data, speaker_mu, speaker_lambda, K, D)
+    listener_scores = (gaussian_log_likelihoods(listener_data, listener_mu, listener_lambda)
+                       if args.mode not in (0, 1) else None)
+    words = w_dk_listener.copy()
+    accepted, labels = 0, []
+    for d in range(D):
+        proposal = np.random.multinomial(n=1, pvals=eta[d], size=1).flatten()
+        if args.mode == 0:
+            w_dk_speaker[d] = proposal
+            labels.append(int(np.argmax(proposal)))
+            continue
+        if args.mode == 1:
+            take = True
+        else:
+            ratio = (listener_scores[d, np.argmax(proposal)] -
+                     listener_scores[d, np.argmax(w_dk_listener[d])])
+            if not np.isfinite(ratio):
+                raise FloatingPointError('Non-finite MH log likelihood ratio')
+            u = np.random.rand()
+            take = u == 0.0 or np.log(u) <= min(0.0, ratio)
+        if take:
+            words[d] = proposal
+            accepted += 1
+        labels.append(int(np.argmax(words[d])))
+    return words, accepted, labels
 
 
 def update_gmm_parameters(
@@ -628,7 +691,7 @@ def main():
 
     # Prepare datasets
     train_loader1, train_loader2, all_loader1, all_loader2, D, indices = prepare_datasets(
-        args.batch_size, args.samples, args.data_root, args.balanced
+        args.batch_size, args.samples, args.data_root, args.balanced, args.cache_images
     )
     np.save(Path(directories['npy_dir']) / 'image_indices.npy', indices)
 

@@ -5,6 +5,7 @@ from torch.nn import functional as F
 from torchvision.utils import save_image
 import numpy as np
 import json
+import time
 from pathlib import Path
 import matplotlib.pyplot as plt
 from tool import visualize_ls, sample, get_param
@@ -122,7 +123,7 @@ class VAE(nn.Module):
             KLD = -0.5 * torch.sum(1 + en_logvar - en_mu.pow(2) - en_logvar.exp())
         return BCE + KLD
 
-def train(iteration, gmm_mu, gmm_var, epoch, train_loader, batch_size, all_loader, model_dir, agent):
+def train(iteration, gmm_mu, gmm_var, epoch, train_loader, batch_size, all_loader, model_dir, agent, cache_prior=False, gpu_images=False, epoch_sync=False):
     if not isinstance(train_loader.sampler, torch.utils.data.SequentialSampler) or train_loader.drop_last:
         raise ValueError("Feedback priors require sequential, complete image order")
     model = VAE().to(device)
@@ -138,29 +139,61 @@ def train(iteration, gmm_mu, gmm_var, epoch, train_loader, batch_size, all_loade
             raise ValueError("Expected full word-conditioned prior for every image")
         np.savez(Path(model_dir) / 'npy' / f'used_prior{agent}_{iteration}.npz',
                  mean=gmm_mu.cpu().numpy(), covariance=gmm_var.cpu().numpy())
+    prepared_prior = None
+    if iteration and cache_prior:
+        from runtime_cache import prepare_gaussian_prior
+        prepared_prior = prepare_gaussian_prior(gmm_mu, gmm_var, device)
     loss_list = np.zeros((epoch))
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    setup_start = time.perf_counter()
+    batches = train_loader
+    if gpu_images:
+        if device.type != 'cuda':
+            raise ValueError('GPU residency requested without CUDA')
+        from runtime_cache import GPUResidentBatches
+        batches = GPUResidentBatches(train_loader, device)
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    resident_setup_s = time.perf_counter() - setup_start
+    training_start = time.perf_counter()
     for i in range(epoch):
         model.train()
         train_loss = 0
-        for batch_idx, (data, _) in enumerate(train_loader):
+        epoch_losses = []
+        for batch_idx, (data, _) in enumerate(batches):
             data = data.to(device)
             optimizer.zero_grad()
             recon_batch, mu, logvar, x_d = model(data)
             if iteration==0: 
                 loss = model.loss_function(recon_batch, data, mu, logvar, gmm_mu=None, gmm_var=None, iteration=iteration)
+            elif prepared_prior is not None:
+                from runtime_cache import cached_gaussian_kl
+                sl = slice(batch_idx*batch_size, (batch_idx+1)*batch_size)
+                loss = F.binary_cross_entropy(recon_batch, data, reduction='sum') + cached_gaussian_kl(
+                    mu, logvar, tuple(x[sl] for x in prepared_prior)).sum()
             else:
                 loss = model.loss_function(recon_batch, data, mu, logvar, gmm_mu[batch_idx*batch_size:(batch_idx+1)*batch_size], gmm_var[batch_idx*batch_size:(batch_idx+1)*batch_size], iteration=iteration)
             loss = loss.mean()
-            if not torch.isfinite(loss):
+            if not epoch_sync and not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite VAE objective")
             loss.backward()
-            train_loss += loss.item()
+            if epoch_sync:
+                epoch_losses.append(loss.detach())
+            else:
+                train_loss += loss.item()
             optimizer.step()
+        if epoch_sync:
+            from runtime_cache import finish_epoch_losses
+            train_loss = finish_epoch_losses(epoch_losses)
         if i == 0 or (i+1) % 25 == 0 or i == (epoch-1):
             print('====> Epoch: {} Average loss: {:.4f}'.format(i+1, train_loss / len(train_loader.dataset)))
             
         loss_list[i] = -(train_loss / len(train_loader.dataset))
     
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    training_loop_s = time.perf_counter() - training_start
     # plot
     plt.figure()
     plt.plot(range(0,epoch), loss_list, color="blue", label="ELBO")
@@ -179,6 +212,8 @@ def train(iteration, gmm_mu, gmm_var, epoch, train_loader, batch_size, all_loade
         'iteration': iteration, 'agent': agent, 'resumed_from': str(resumed) if resumed else None,
         'prior': 'full-gmm' if iteration else 'standard-normal',
         'epochs': epoch, 'final_negative_objective_per_image': float(loss_list[-1]),
+        'training_loop_s': training_loop_s, 'resident_setup_s': resident_setup_s,
+        'gpu_images': gpu_images, 'epoch_sync': epoch_sync,
     }, indent=2), encoding='utf-8')
     
     x_d, label = send_all_x(iteration=iteration, all_loader=all_loader, model_dir=model_dir, agent=agent)

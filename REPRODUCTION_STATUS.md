@@ -40,6 +40,38 @@ Use --mutual-iterations 1 to disable subsequent feedback, or a larger value to t
   consistent readouts. Per-round scientific results have not been generated here.
 - Independent audit is required before making publication claims.
 
+### Update: preliminary MNIST comparison completed, 2026-10-24
+
+The historical pending statements above describe earlier stages. The repaired,
+cached implementation completed four methods on seeds 0..4, using 10,000 balanced
+images, 100 VAE epochs and 100 naming sweeps per block, five blocks, batch 128,
+prior scale .05. Mean +/- sample SD of terminal outcomes (not training maxima):
+
+| Method | ARI A | ARI B | Kappa |
+| --- | --- | --- | --- |
+| Central Gibbs | .755 +/- .078 | .755 +/- .078 | N/A |
+| MHNG | .774 +/- .057 | .774 +/- .058 | .971 +/- .008 |
+| All-accept | .627 +/- .015 | .618 +/- .007 | .770 +/- .012 |
+| No-comm. | .556 +/- .064 | .628 +/- .038 | .001 +/- .043 |
+
+MHNG exceeded both baselines in agent-averaged ARI on all five seeds, and word
+agreement followed MHNG > All-accept > No-comm. Central Gibbs and baseline ARI
+were lower than the original Table 1, and the mean MHNG/Gibbs ranking reversed.
+This is preliminary qualitative agreement, not exact numerical reproduction,
+an equivalence test, or an independently audited release. No-MI benefit is untested.
+
+Thirty tests passed on the CUDA experiment snapshot, with two pre-existing
+single-label fixture warnings. Optional caches preserve the model/update budget;
+round-off differences in stochastic trajectories remain possible. CUDA settings
+used deterministic algorithms, deterministic cuDNN, disabled benchmark and TF32,
+and CUBLAS_WORKSPACE_CONFIG=:4096:8. AMD/ROCm smoke runs had small internal MHNG
+differences despite identical evaluation metrics; flags alone do not certify
+bitwise reproducibility across executions or devices.
+
+`python deterministic_entry.py --paper-mnist --mode -1 --seed 0 --cache-images
+--cache-prior --gpu-images --epoch-sync --run-dir NEW_RUN` applies those settings.
+Raw datasets/checkpoints are not included in Git.
+
 ## Branch separation
 
 `reproduce-inter-gmm-vae` is for source-aligned corrections and tests.

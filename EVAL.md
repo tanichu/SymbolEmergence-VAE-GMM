@@ -20,7 +20,7 @@ Gibbs from the likelihood product. All use the same model/prior and local update
 counts. Central has a common word, so kappa is not a meaningful communication
 metric and is stored as NaN. Central does not use test labels to sample words.
 
-Primary target: 16 seeds, numbered 0..15, all four methods. Independent VAE
+Initial target: 16 seeds, numbered 0..15, all four methods. Independent VAE
 initialization, no label alignment. No seed-specific restart/early stopping or
 best-seed selection. Report paired seed differences and full ranges, not only
 published-score proximity. Report terminal ARI (agent-averaged), raw kappa for
@@ -54,3 +54,10 @@ directory, not public GitHub. Queue time and environment setup are separate.
 Independent audit: isolated code-only reconstruction, fresh different-family
 auditor, separate false-positive review, verify quoted lines and tests. Full-run
 results will need the same audit claims revisited after results exist.
+
+## Completed preliminary comparison (2026-10-24)
+
+The author reduced the budget to the first five seeds (0..4) for qualitative
+replication. All four methods completed on all five seeds with the profile above.
+No seed was selected by score; later-seed partial work is excluded. No-MI controls
+were not run and are not implied by this comparison. See REPRODUCTION_STATUS.md.
